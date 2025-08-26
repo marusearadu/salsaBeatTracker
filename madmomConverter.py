@@ -123,7 +123,3 @@ class MyMadmom(nn.Module):
         out    = self.activation(out)
         
         return out
-    
-torchModel = MyMadmom(input_size = inputSize, hidden_size = hiddenSize, output_size = outputSize, bidirectional = bidirectional)
-madmomWeights = extractMadmomWeights(model, bidir = bidirectional)
-setWeights(torchModel, madmomWeights, bidir = bidirectional)
