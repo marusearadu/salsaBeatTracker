@@ -1,7 +1,4 @@
-- refactor MyMadmom to include all the outside functions as methods
-- |-> add typing annotations for functions (i.e., what does function x return?)
-- |-> plus all the variables as its own params
-- |-> plus use nn.LSTM(..., num_layers = 3)
+- add typing annotations for functions (i.e., what does function x return?)
 - add peephole connections (?)
 - add comments
 - tweak bias storage(?) - copilot says: 
