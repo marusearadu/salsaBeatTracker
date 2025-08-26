@@ -1,7 +1,5 @@
 - refactor MyMadmom to include all the outside functions as methods
-- |-> refactor the __extractMadmomWeights function to use self.bidir
-- |----> maybe even combine __getParams with __extractMadmomWeights? 
-- |-> i shouldn't save the model as a part of the class, so maybe make __getParams a subfunction of __init __ ?
+- |-> add typing annotations for functions (i.e., what does function x return?)
 - |-> plus all the variables as its own params
 - |-> plus use nn.LSTM(..., num_layers = 3)
 - add peephole connections (?)

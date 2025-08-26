@@ -1,8 +1,11 @@
+import numpy as np
+from pyparsing import Dict
+
 import madmom
 from madmom.ml.nn import NeuralNetwork as NN
 # from madmom.models import BEATS_LSTM, BEATS_BLSTM
 
-import numpy as np
+import torch
 from torch import nn
 
 class MyMadmom(nn.Module):
@@ -11,12 +14,9 @@ class MyMadmom(nn.Module):
     """
     def __init__(self, madmomModel: NN):
         super(MyMadmom, self).__init__()
-        # getting all the params
-        self.ogModel    = madmomModel
-        self.__getParams()
-        weights = self.__extractMadmomWeights()
+        self.__setParams(madmomModel)
+
         # 3 LSTM layers + feedforward + activation
-        
         self.lstm1 = nn.LSTM(
             input_size = self.inputSize,
             hidden_size = self.hiddenSize,
@@ -34,15 +34,17 @@ class MyMadmom(nn.Module):
         )
         self.ff         = nn.Linear(in_features = self.hiddenSize * self.D, out_features = self.outputSize)
         self.activation = nn.Sigmoid()
-    
 
-    def __getParams(self):
+        weights = self.__extractMadmomWeights(madmomModel)
+        self.__setWeights(weights)
+
+    def __setParams(self, model: NN) -> None:
         inputSize     = None
         hiddenSize    = None
         outputSize    = None
         bidirectional = False
 
-        for layer in self.ogModel.layers:
+        for layer in model.layers:
             if 'lstm' in type(layer).__name__.lower():
                 # Get input size from first LSTM layer's input gate weights
                 assert hasattr(layer, 'input_gate'), "Mono-layer doesn't have input-gate"
@@ -77,21 +79,12 @@ class MyMadmom(nn.Module):
         self.bidir      = bidirectional
         self.D          = self.bidir + 1
 
-    def __extractMadmomWeights(self):
+    def __extractMadmomWeights(self, model: NN) -> Dict[str, np.ndarray]:
         weights = {}
         gates = ["input_gate", "forget_gate", "cell", "output_gate"]
-        for i, layer in enumerate(self.ogModel.layers):
-            layerType = type(layer).__name__.lower()
-
-            if "lstm" in layerType:
-                for gateName in gates:
-                    gate = getattr(layer, gateName)
-
-                    weights[f"lstm{i}_{gateName}_weights"] = gate.weights
-                    weights[f"lstm{i}_{gateName}_recurrent_weights"] = gate.recurrent_weights
-                    weights[f"lstm{i}_{gateName}_bias"] = gate.bias
-
-            elif "bidirectional" in layerType:
+        for i, layer in enumerate(model.layers):
+            if self.bidir and hasattr(layer, "fwd_layer"):
+                # bidirectional lstm layer
                 for sublayerName in ["fwd_layer", "bwd_layer"]:
                     sublayer = getattr(layer, sublayerName)
                     for gateName in gates:
@@ -101,11 +94,68 @@ class MyMadmom(nn.Module):
                         weights[f"bidir{i}_{sublayerName}_{gateName}_recurrent_weights"] = gate.recurrent_weights
                         weights[f"bidir{i}_{sublayerName}_{gateName}_bias"] = gate.bias
 
-            elif "forward" in layerType.lower():
+            elif not self.bidir and hasattr(layer, gates[0]):
+                # unidirectional lstm layer
+                for gateName in gates:
+                    gate = getattr(layer, gateName)
+
+                    weights[f"lstm{i}_{gateName}_weights"] = gate.weights
+                    weights[f"lstm{i}_{gateName}_recurrent_weights"] = gate.recurrent_weights
+                    weights[f"lstm{i}_{gateName}_bias"] = gate.bias
+
+            elif hasattr(layer, "weights") and hasattr(layer, "bias"):
+                # feedforward layer
                 weights[f"forward{i}_weights"] = layer.weights
                 weights[f"forward{i}_bias"] = layer.bias
 
         return weights
+
+    def __setWeights(self, weights: Dict[str, np.ndarray]):
+        def __concatWeights(prefix: str):
+            W = torch.from_numpy(np.concatenate([
+                    weights[f"{prefix}_input_gate_weights"].T,
+                    weights[f"{prefix}_forget_gate_weights"].T,
+                    weights[f"{prefix}_cell_weights"].T,
+                    weights[f"{prefix}_output_gate_weights"].T
+                ])).float()
+            R = torch.from_numpy(np.concatenate([
+                weights[f"{prefix}_input_gate_recurrent_weights"].T,
+                weights[f"{prefix}_forget_gate_recurrent_weights"].T,
+                weights[f"{prefix}_cell_recurrent_weights"].T,
+                weights[f"{prefix}_output_gate_recurrent_weights"].T
+            ])).float()
+            b = torch.from_numpy(np.concatenate([
+                weights[f"{prefix}_input_gate_bias"].T,
+                weights[f"{prefix}_forget_gate_bias"].T,
+                weights[f"{prefix}_cell_bias"].T,
+                weights[f"{prefix}_output_gate_bias"].T
+            ])).float()
+
+        def __setLSTMlayerWeights(lstmLayer: nn.LSTM, layerID: int):
+            prefix = f"bidir{layerID}_fwd_layer" if self.bidir else f"lstm{layerID}"
+            W, R, b = __concatWeights(prefix)
+
+            lstmLayer.weight_hh_l0.data = R
+            lstmLayer.weight_ih_l0.data = W
+            lstmLayer.bias_ih_l0.data   = b
+            lstmLayer.bias_hh_l0.data   = torch.zeros_like(b)
+
+            if self.bidir:
+                W, R, b = __concatWeights(f"bidir{layerID}_bwd_layer")
+
+                lstmLayer.weight_hh_l0_reverse.data = R
+                lstmLayer.weight_ih_l0_reverse.data = W
+                lstmLayer.bias_ih_l0_reverse.data   = b
+                lstmLayer.bias_hh_l0_reverse.data   = torch.zeros_like(b)
+
+            return W, R, b
+
+        __setLSTMlayerWeights(self.lstm1, 0)
+        __setLSTMlayerWeights(self.lstm2, 1)
+        __setLSTMlayerWeights(self.lstm3, 2)
+
+        self.ff.weight.data = torch.from_numpy(self.weights["forward3_weights"].T).float()
+        self.ff.bias.data   = torch.from_numpy(self.weights["forward3_bias"].T).float()
 
     def forward(self, x, reset = True):
         def _getZerosTensors():
