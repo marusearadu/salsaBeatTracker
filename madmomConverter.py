@@ -3,6 +3,7 @@ import numpy as np
 
 import madmom
 from madmom.ml.nn import NeuralNetwork as NN
+from madmom.features.beats import DBNBeatTrackingProcessor as DBN
 # from madmom.models import BEATS_LSTM, BEATS_BLSTM
 
 import torch
@@ -12,9 +13,10 @@ class MadmomToTorchConverter(nn.Module):
     """
     PyTorch equivalent of madmom's RNN model with 3 LSTM layers + 1 feedforward layer
     """
-    def __init__(self, madmomModel: NN):
+    def __init__(self, madmomModel: NN, beatTrackingProcessor: DBN):
         super(MadmomToTorchConverter, self).__init__()
         self.__setParams(madmomModel)
+        self.beatTrackingProcessor = beatTrackingProcessor
 
         # 3 LSTM layers + feedforward + activation
         self.lstm = nn.LSTM(
@@ -168,5 +170,6 @@ class MadmomToTorchConverter(nn.Module):
         out, _ = self.lstm(x, __getZerosTensors()) if reset else self.lstm(x)
         out    = self.ff(out)
         out    = self.activation(out)
-        
+        out    = self.beatTrackingProcessor(out.detach().cpu().numpy().flatten())
+
         return out
