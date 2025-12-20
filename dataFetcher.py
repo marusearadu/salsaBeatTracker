@@ -21,7 +21,7 @@ load_dotenv("keys.env")
 apiServiceName = "youtube"
 apiVersion     = "v3"
 acoustidURL    = "https://api.acoustid.org/v2/lookup"
-THRESHOLD      = 0.8
+THRESHOLD      = 0.7
 
 songsDir       = Path("data/songs/")
 fpDir          = Path("data/fingerprints/")
@@ -59,26 +59,30 @@ dfPlaceholder = songsDir / "postprocessed.mp3"
 # inclusive end index
 # needed as a separate function as it makes more sense to ping youtube separately (fast returns)
 # yet downloading takes forever, so i could just run it later
-def fetchYoutubeLinks(startAt: int = 1, maxIndex: int = 5, save: bool = True) -> pd.DataFrame:
+def fetchYoutubeLinks(startAt: int = 1, maxIndex: int = 5, save: bool = True, results: int = 5) -> pd.DataFrame:
     ids      = {}
     youtube = googleapiclient.discovery.build(
             apiServiceName, 
             apiVersion, 
-            developerKey = os.environ.get("GOOGLE_API_KEY")
+            developerKey = os.environ.get("GOOGLE_API_KEY_2")
         )
     
     for i in range(startAt, maxIndex + 1):
         request = youtube.search().list(
             part = "snippet",
-            maxResults = maxResults,
+            maxResults = results,
             q = f"{metadataDF.loc[i].artist} - {metadataDF.loc[i].title} in album {metadataDF.loc[i].album}",
             type = "video"
         )
         response = request.execute()
+        if len(response['items']) == 0 or not response['items'][0]['id'].get('videoId'):
+            print(i)
+            continue
 
-        ids[i] = [item['id']['videoId'] for item in response['items']]
+        ids[i] = [item['id'].get('videoId') for item in response['items']][:results]
+        time.sleep(0.5)
 
-    df_result = pd.DataFrame.from_dict(ids, orient='index')
+    df_result = pd.DataFrame.from_dict(ids, orient = 'index')
     # Name columns based on the actual number of columns returned,
     # not on the requested maxResults (API may return fewer/more).
     df_result.columns = [f'result_{j+1}' for j in range(df_result.shape[1])]
@@ -90,7 +94,7 @@ def fetchYoutubeLinks(startAt: int = 1, maxIndex: int = 5, save: bool = True) ->
     return df_result
 
 # inclusive end index
-def fetchSongs(df: pd.DataFrame, startAt: int = 1, maxIndex: int = 5, force: bool = False, process_id: int = 0):
+def fetchSongs(df: pd.DataFrame, startAt: int = 1, maxIndex: int = 5, results: int = 5, force: bool = False, process_id: int = 0):
     """
     Download candidate songs from YouTube based on the IDs in `df`.
     Does NOT perform any acoustID matching or cleanup.
@@ -103,14 +107,20 @@ def fetchSongs(df: pd.DataFrame, startAt: int = 1, maxIndex: int = 5, force: boo
     placeholder = songsDir / f"postprocessed_{process_id}.mp3"
     
     for i in range(startAt, maxIndex + 1):
+        # Some indices might not have any YouTube candidates (missing rows in df).
+        # In that case, just skip them instead of raising a KeyError.
+        if i not in df.index:
+            print(f"No YouTube candidates found for song {i}, skipping download.")
+            continue
         target = songsDir / f"{i}.mp3"
         if target.exists() and not force:
             print(f"Song {i} already exists, skipping download.")
             continue
         os.remove(target) if target.exists() else None
 
-        N = df.loc[i].dropna().shape[0]
-        for j, id in enumerate(df.loc[i].dropna().values):
+        N = min(df.loc[i].dropna().shape[0], results)
+        for j in range(N):
+            id = df.loc[i].dropna().values[j]
             target = songsDir / f"{i}_{j}.mp3"
             if target.exists() and not force:
                 print(f"Song {i}_{j} already exists, skipping download.")
@@ -118,16 +128,21 @@ def fetchSongs(df: pd.DataFrame, startAt: int = 1, maxIndex: int = 5, force: boo
             os.remove(target) if target.exists() else None
 
             youtubeURL = f"https://www.youtube.com/watch?v={id}"
+            meta = ydl.extract_info(youtubeURL, download = False)
+
+            if (meta is None) or (meta.get('duration') is None) or (meta.get('duration') > 1200) or (meta.get('filesize') is not None and meta.get('filesize') > 512 * 1024 * 1024):  # pyright: ignore[reportOptionalMemberAccess, reportOptionalOperand]
+                print(f"Video is too big or long (duration = {meta.get('duration')}); probably a collection of songs, so skipping it.")
+                continue
             try:
                 ydl.download([youtubeURL])
                 Path.rename(placeholder, songsDir / f"{i}_{j}.mp3")
             except Exception as e:
                 print(f"Failed to download {youtubeURL}: {e}")
                 continue
-            time.sleep(2)  # Add delay between downloads to avoid rate limiting
+            # time.sleep(2)  # Add delay between downloads to avoid rate limiting
 
 
-def getBestFit(df: pd.DataFrame, metadataDF: pd.DataFrame, startAt: int = 1, maxIndex: int = 5, force: bool = False) -> dict:
+def getBestFit(df: pd.DataFrame, startAt: int = 1, maxIndex: int = 5, results: int = 5, force: bool = False):
     """
     For each song index, run fpcalc + AcoustID lookup on all downloaded
     candidates and keep only the best-matching one.
@@ -135,7 +150,12 @@ def getBestFit(df: pd.DataFrame, metadataDF: pd.DataFrame, startAt: int = 1, max
     """
     bestFit: dict[int, list] = {}
     for i in range(startAt, maxIndex + 1):
-        N = df.loc[i].dropna().shape[0]
+        # If this index has no candidates in df, there is nothing to match.
+        if i not in df.index:
+            print(f"No YouTube candidates found for song {i}, skipping AcoustID matching.")
+            continue
+
+        N = min(df.loc[i].dropna().shape[0], results)
         target   = songsDir / f"{i}.mp3"
         if target.exists() and not force:
             print(f"Song {i} is already the best fit.")
@@ -143,7 +163,6 @@ def getBestFit(df: pd.DataFrame, metadataDF: pd.DataFrame, startAt: int = 1, max
         os.remove(target) if target.exists() else None
         score    = 0.0
         bestID   = -1
-        bestVideoID = None
         # acoustID to match (from metadata, not from YouTube ID DataFrame)
         acoustID = metadataDF.loc[i, "acoustID"]
 
@@ -176,11 +195,10 @@ def getBestFit(df: pd.DataFrame, metadataDF: pd.DataFrame, startAt: int = 1, max
                 if acoustID == d['id'] and d['score'] > score:
                     score  = d['score']
                     bestID = j
-                    bestVideoID = df.loc[i].dropna().values[j]
             
         if bestID != -1 and score >= THRESHOLD:
             print(f"Found a match with score {score} under the ID {bestID}.")
-            link = f"https://www.youtube.com/watch?v={bestVideoID}"
+            link = f"https://www.youtube.com/watch?v={df.loc[i].dropna().values[bestID]}"
             bestFit[i] = [link, score]
             # rename the song to the target file
             os.rename(songsDir / f"{i}_{bestID}.mp3", target)
@@ -204,11 +222,11 @@ def process_chunk(args_tuple):
     Processes a chunk: fetches songs and gets best fit.
     Returns the bestFit dict for merging.
     """
-    df_chunk, metadataDF, chunk_start, chunk_end, force, chunk_id = args_tuple
+    df_chunk, metadataDF, chunk_start, chunk_end, results, force, chunk_id = args_tuple
     # Fetch songs for this chunk
-    fetchSongs(df_chunk, startAt=chunk_start, maxIndex=chunk_end, force=force, process_id=chunk_id)
+    fetchSongs(df_chunk, startAt = chunk_start, maxIndex = chunk_end, results = results, force = force, process_id = chunk_id)
     # Get best fit for this chunk
-    return getBestFit(df_chunk, metadataDF, startAt=chunk_start, maxIndex=chunk_end, force=force)
+    return getBestFit(df_chunk, startAt = chunk_start, maxIndex = chunk_end, results = results, force = force)
     
 if __name__ == "__main__":
     # handle input arguments
@@ -225,7 +243,7 @@ if __name__ == "__main__":
     maxResults = args.numSongs
     maxIndex   = metadataDF.shape[0] if args.endAt == 0 else min(args.endAt, metadataDF.shape[0])
     if args.fetchYoutubeLinks or not allSourcesFile.exists():
-        sourcesDF = fetchYoutubeLinks(startAt = args.startAt, maxIndex = maxIndex, save = args.save)
+        sourcesDF = fetchYoutubeLinks(startAt = args.startAt, maxIndex = maxIndex, results = maxResults, save = args.save)
     else:
         sourcesDF = pd.read_csv(allSourcesFile, index_col = 0)
     
@@ -241,7 +259,7 @@ if __name__ == "__main__":
         chunk_end = min(chunk_start + chunk_size - 1, maxIndex)
         if chunk_start > maxIndex:
             break
-        chunks.append((sourcesDF, metadataDF, chunk_start, chunk_end, args.force, i))
+        chunks.append((sourcesDF, metadataDF, chunk_start, chunk_end, maxResults, args.force, i))
     
     # Process chunks in parallel
     print(f"Processing {len(chunks)} chunks across {num_cores} cores...")
